@@ -270,58 +270,6 @@ class NormalizingFlow(nn.Module):
             zs = jnp.stack(zs, axis=0)
             assert zs.shape == (self.num_blocks, B, T, C), f"zs shape: {zs.shape}, {B}, {T}, {C}"
             return zs
-    
-    def forward_flatten(self, 
-                x: jnp.ndarray, 
-                y: jnp.ndarray | None = None, 
-                temp: float = 1.0, 
-                which_cache: str = 'cond', 
-                train: bool = True,
-                rng = None,
-        ):
-            raise LookupError("没用到？")
-            B, T, C = x.shape
-            xs = jnp.zeros((self.num_blocks+1, B, T, C), dtype=self.dtype)
-            alphas = jnp.zeros((self.num_blocks, B, T, C), dtype=self.dtype)
-            mus = jnp.zeros((self.num_blocks, B, T, C), dtype=self.dtype)
-            xs = xs.at[0].set(x)
-
-            tot_logdet = 0.0
-            i = 0
-            for block in self.blocks:
-                rng, rng_used = safe_split(rng)
-                x, logdet, alpha, mu = block.forward(x, y, temp=temp, which_cache=which_cache, train=train, rng=rng_used)
-                alphas = alphas.at[i].set(alpha)
-                mus = mus.at[i].set(mu)
-                i += 1
-                xs = xs.at[i].set(x)
-                tot_logdet = tot_logdet + logdet
-                del rng_used
-            
-            log_prior = 0.5 * (x ** 2).mean()
-            loss = - tot_logdet.mean() + log_prior
-            loss_dict = {'loss': loss, 'log_det': tot_logdet.mean(), 'log_prior': log_prior}
-            
-            return loss, loss_dict, xs, alphas, mus
-        
-    def reverse(self,
-                x: jnp.ndarray,
-                y: jnp.ndarray | None = None,
-                temp: float = 1.0,
-                which_cache: str = 'cond',
-                train: bool = False,
-        ):
-        raise LookupError("没用到？")
-        x = self.patchify(x)
-        tot_log_jacob = 0.0
-        for i in range(self.num_blocks-1,-1,-1):
-            x, log_jacob = self.blocks[i].reverse(x, y, temp=temp, which_cache=which_cache, train=train)
-            tot_log_jacob += log_jacob
-            
-        log_prior = 0.5 * (x ** 2).mean()
-        loss = - tot_log_jacob.mean() + log_prior
-        loss_dict = {'loss': loss, 'log_det': tot_log_jacob.mean(), 'log_prior': log_prior}
-        return loss, loss_dict, x
         
     def __call__(self, 
                 x: jnp.ndarray, 
@@ -444,17 +392,7 @@ class TeacherStudent(nn.Module):
         x = x.transpose(0, 1, 3, 2, 4, 5)
         x = x.reshape(B, self.img_size, self.img_size, self.out_channels)
         return x
-    
-    def calc_student_reverse(self, x, y, temp: float = 1.0, which_cache: str = 'cond', train: bool = False):
-        raise LookupError("not used for now")
-        _, _, z = self.student.reverse(x, y, temp=temp, which_cache=which_cache, train=train)
-        return z
-    
-    def calc_student_forward(self, x, y, temp: float = 1.0, which_cache: str = 'cond', train: bool = False):
-        raise LookupError("not used for now")
-        _, _, zs, _, _ = self.student(x, y, temp=temp, which_cache=which_cache, train=train)
-        return zs[-1]
-    
+
     def calc_teacher_forward(self, x, y, temp: float = 1.0, which_cache: str = 'cond', train: bool = True):
         # used for denoise. The loss here is logp.
         loss, _, _, _, _ = self.teacher(x, y, temp=temp, which_cache=which_cache, train=train)
