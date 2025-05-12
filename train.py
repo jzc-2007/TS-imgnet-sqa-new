@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import input_pipeline
 from input_pipeline import prepare_batch_data
 import models.tarflow as tarflow
-from models.tarflow import TeacherStudent, generate, edm_ema_scales_schedules, generate_prior
+from models.tarflow import generate, edm_ema_scales_schedules, UNetTeacherStudent
 from utils.vae_util import LatentManager
 from utils.info_util import print_params
 from utils.vis_util import make_grid_visualization, float_to_uint8
@@ -441,8 +441,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str) -> Train
     ######################################################################
     #                       Create Train State                           #
     ######################################################################
-
-    model: TeacherStudent = create_model(
+    rng_create, rng = random.split(rng, 2)
+    model: UNetTeacherStudent = create_model(
         model_cls = getattr(tarflow, config.model.name),
         half_precision=config.training.half_precision,
         num_classes=config.dataset.num_classes,

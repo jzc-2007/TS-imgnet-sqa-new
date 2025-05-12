@@ -19,13 +19,14 @@ from .jcm import layers, layerspp, normalization
 import flax.linen as nn
 import functools
 import jax.numpy as jnp
+import jax
 import numpy as np
-import ml_collections
+# import ml_collections
 
 from typing import Any, Sequence
 
 
-from absl import logging
+# from absl import logging
 
 ResnetBlockDDPM = layerspp.ResnetBlockDDPMpp
 ResnetBlockBigGAN = layerspp.ResnetBlockBigGANpp
@@ -39,8 +40,9 @@ default_initializer = layers.default_init
 
 class NCSNpp(nn.Module):
     """NCSN++ model"""
+
     base_width: int = 128
-    image_size: int = 32
+    img_size: int = 32
     ch_mult: Sequence[int] = (2, 2, 2)
     num_res_blocks: int = 4
     attn_resolutions: Sequence[int] = (16,)
@@ -48,14 +50,17 @@ class NCSNpp(nn.Module):
     fir_kernel: Sequence[int] = (1, 3, 3, 1)
     resblock_type: str = "biggan"
     fourier_scale: float = 16.0
+    embedding_type: str = "fourier"
 
     @nn.compact
-    def __call__(self, x, time_cond, train=True, verbose=True):
+    def __call__(self, x, time_cond, t_mask = None, labels=None, train=True, logging_fn=(lambda _: None), rng=None):
+
+        if t_mask is None:
+            t_mask = jnp.ones_like(time_cond, dtype=jnp.float32)
         
         assert time_cond.ndim == 1  # only support 1-d time condition
+        assert t_mask.ndim == 1
         assert time_cond.shape[0] == x.shape[0]
-
-        logging_fn = logging.info if verbose else lambda x: None
 
         # --------------------
         # redefine arguments:
@@ -75,8 +80,9 @@ class NCSNpp(nn.Module):
         skip_rescale = True
         resblock_type = self.resblock_type
         progressive = "none"
+        embedding_type = self.embedding_type
         progressive_input = "residual"
-        embedding_type = "fourier"
+        assert embedding_type == "fourier", f"edm must use fourier embedding"
         fourier_scale = self.fourier_scale
         init_scale = 0.0
 
@@ -89,12 +95,16 @@ class NCSNpp(nn.Module):
 
         double_heads = False
         # --------------------
+        t_emb_dim = nf if embedding_type == "positional" else nf * 2
+        temb_wot = nn.Embed(num_embeddings=1, features=t_emb_dim, name="embed_for_wot")(jnp.zeros_like(time_cond, dtype=jnp.int32))
 
         # timestep/noise_level embedding; only for continuous training
         if embedding_type == "fourier":
             # Gaussian Fourier features embeddings.
             temb = layerspp.GaussianFourierProjection(
-                embedding_size=nf, scale=fourier_scale
+                embedding_size=nf,
+                scale=fourier_scale,
+                name="map_noise",
             )(time_cond)
         elif embedding_type == "positional":
             raise NotImplementedError
@@ -104,9 +114,25 @@ class NCSNpp(nn.Module):
             raise NotImplementedError
             raise ValueError(f"embedding type {embedding_type} unknown.")
 
+        t_mask = t_mask[:, None]  # (B, 1)
+        temb = temb * t_mask + temb_wot * (1 - t_mask) # 1 for wt, 0 for wot
+
+        if labels is not None:
+            aemb = nn.Dense(
+                nf * 2,
+                kernel_init=default_initializer(),
+                use_bias=False,
+                name="map_augment",
+            )(labels)
+            temb += aemb
+
         if conditional:
-            temb = nn.Dense(nf * 4, kernel_init=default_initializer())(temb)
-            temb = nn.Dense(nf * 4, kernel_init=default_initializer())(act(temb))
+            temb = nn.Dense(
+                nf * 4, kernel_init=default_initializer(), name="map_layer0"
+            )(temb)
+            temb = nn.Dense(
+                nf * 4, kernel_init=default_initializer(), name="map_layer1"
+            )(act(temb))
         else:
             raise NotImplementedError
             temb = None
@@ -174,37 +200,60 @@ class NCSNpp(nn.Module):
         else:
             raise ValueError(f"resblock type {resblock_type} unrecognized.")
 
+        # utility function to count number of parameters
+        def pms(self, name):
+            tree = jax.tree_map(
+                lambda x: np.prod(x.shape), self.variables["params"][name]
+            )
+            return jax.tree_util.tree_reduce(lambda x, y: x + y, tree, initializer=0)
+
+        ps = functools.partial(pms, self)
+
+        # begin of the work
         # Downsampling block
+
+        cur_size = self.img_size
 
         input_pyramid = None
         if progressive_input != "none":
             input_pyramid = x
 
         logging_fn(f"Input shape {x.shape}")
-        hs = [conv3x3(x, nf)]
-        logging_fn(f"Level 0, shape {hs[-1].shape}")
+        name = f"enc_{cur_size}x{cur_size}_conv"  # 32x32_conv
+        hs = [conv3x3(x, nf, name=name)]
+        logging_fn(f"{name}: params {ps(name)}, shape {hs[-1].shape}")
         for i_level in range(num_resolutions):
             # Residual blocks for this resolution
             for i_block in range(num_res_blocks):
-                h = ResnetBlock(out_ch=nf * ch_mult[i_level])(hs[-1], temb, train)
+                name = f"enc_{cur_size}x{cur_size}_block{i_block}"
+                h = ResnetBlock(out_ch=nf * ch_mult[i_level], name=name)(
+                    hs[-1], temb, train
+                )
+                logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
                 if h.shape[1] in attn_resolutions:
-                    h = AttnBlock()(h)
+                    name = f"enc_{cur_size}x{cur_size}_block{i_block}_attn"
+                    h = AttnBlock(name=name)(h)
+                    logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
                 hs.append(h)
-                logging_fn(f"Level {i_level}, block {i_block}, shape {h.shape}")
 
             if i_level != num_resolutions - 1:
                 if resblock_type == "ddpm":
+                    raise NotImplementedError
                     h = Downsample()(hs[-1])
                 else:
-                    h = ResnetBlock(down=True)(hs[-1], temb, train)
-                logging_fn(f"Level {i_level}, downsampled shape {h.shape}")
+                    cur_size //= 2
+                    name = f"enc_{cur_size}x{cur_size}_down"
+                    h = ResnetBlock(down=True, name=name)(hs[-1], temb, train)
+                logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
 
                 if progressive_input == "input_skip":
+                    raise NotImplementedError
                     input_pyramid = pyramid_downsample()(input_pyramid)
                     h = combiner()(input_pyramid, h)
 
                 elif progressive_input == "residual":
-                    input_pyramid = pyramid_downsample(out_ch=h.shape[-1])(
+                    name = f"enc_{cur_size}x{cur_size}_aux_residual"
+                    input_pyramid = pyramid_downsample(out_ch=h.shape[-1], name=name)(
                         input_pyramid
                     )
                     if skip_rescale:
@@ -214,31 +263,39 @@ class NCSNpp(nn.Module):
                     else:
                         input_pyramid = input_pyramid + h
                     h = input_pyramid
+                    logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
 
-                logging_fn(f"Level {i_level}, combined shape {h.shape}")
+                # logging_fn(f"Level {i_level}, combined shape {h.shape}")
                 hs.append(h)
 
         h = hs[-1]
-        h = ResnetBlock()(h, temb, train)
-        logging_fn(f"Level {num_resolutions}, shape {h.shape}")
-        h = AttnBlock()(h)
-        logging_fn(f"Level {num_resolutions}, attn shape {h.shape}")
-        h = ResnetBlock()(h, temb, train)
-        logging_fn(f"Level {num_resolutions}, shape {h.shape}")
+        name = f"dec_{cur_size}x{cur_size}_in0"
+        h = ResnetBlock(name=name)(h, temb, train)
+        logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
+
+        name = f"dec_{cur_size}x{cur_size}_in0_attn"
+        h = AttnBlock(name=name)(h)
+        logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
+
+        name = f"dec_{cur_size}x{cur_size}_in1"
+        h = ResnetBlock(name=name)(h, temb, train)
+        logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
 
         pyramid = None
 
         # Upsampling block
         for i_level in reversed(range(num_resolutions)):
             for i_block in range(num_res_blocks + 1):
-                h = ResnetBlock(out_ch=nf * ch_mult[i_level])(
+                name = f"dec_{cur_size}x{cur_size}_block{i_block}"
+                h = ResnetBlock(out_ch=nf * ch_mult[i_level], name=name)(
                     jnp.concatenate([h, hs.pop()], axis=-1), temb, train
                 )
-                logging_fn(f"Level {i_level}, block {i_block}, shape {h.shape}")
+                logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
 
             if h.shape[1] in attn_resolutions:
-                h = AttnBlock()(h)
-                logging_fn(f"Level {i_level}, attn shape {h.shape}")
+                name = f"dec_{cur_size}x{cur_size}_block{i_block}_attn"
+                h = AttnBlock(name=name)(h)
+                logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
 
             if progressive != "none":
                 raise NotImplementedError
@@ -279,22 +336,29 @@ class NCSNpp(nn.Module):
 
             if i_level != 0:
                 if resblock_type == "ddpm":
+                    raise NotImplementedError
                     h = Upsample()(h)
                 else:
-                    h = ResnetBlock(up=True)(h, temb, train)
-                logging_fn(f"Level {i_level}, upsampled shape {h.shape}")
+                    cur_size *= 2
+                    name = f"dec_{cur_size}x{cur_size}_up"
+                    h = ResnetBlock(up=True, name=name)(h, temb, train)
+                logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
 
         assert not hs
 
         if progressive == "output_skip" and not double_heads:
+            raise NotImplementedError
             h = pyramid
         else:
-            h = act(nn.GroupNorm(num_groups=min(h.shape[-1] // 4, 32))(h))
+            name = f"dec_{cur_size}x{cur_size}_aux_norm"
+            h = act(nn.GroupNorm(num_groups=min(h.shape[-1] // 4, 32), name=name)(h))
+            logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
             if double_heads:
+                raise NotImplementedError
                 h = conv3x3(h, x.shape[-1] * 2, init_scale=init_scale)
             else:
-                h = conv3x3(h, x.shape[-1], init_scale=init_scale)
+                name = f"dec_{cur_size}x{cur_size}_aux_conv"
+                h = conv3x3(h, x.shape[-1], init_scale=init_scale, name=name)
+                logging_fn(f"{name}: params {ps(name)}, shape {h.shape}")
         logging_fn(f"Output shape {h.shape}")
         return h
-
-

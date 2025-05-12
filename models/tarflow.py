@@ -7,7 +7,8 @@ import jax.numpy as jnp
 from functools import partial
 
 from utils.logging_utils import log_for_0
-from models.layers import safe_split, MetaBlock, PermutationFlip
+from models.jcm.layers import safe_split, MetaBlock, PermutationFlip
+from models.models_ncsnpp import NCSNpp
 
 ModuleDef = Any
 # print = lambda *args, **kwargs : None
@@ -141,6 +142,275 @@ def reverse_block_student(
             x_out = block.permutation(x_out, inverse=True)
     
     return x_out
+class UNetStudent(nn.Module):
+    """
+    UNet student model.
+    """
+    img_size: int = 32
+    patch_size: int = 4
+    out_channels: int = 4
+    base_width: int = 32
+    num_classes: int = 1000
+    num_unets: int = 1
+    time_cond_method: str = "base" # options: base, cond, wot
+    dtype: Any = jnp.float32
+    dropout: float = 0.0
+
+    def patchify(self, x):
+        B, H, W, C = x.shape
+        assert C == self.out_channels, "input must be RGB image"
+        x = x.reshape(B, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size, C)
+        x = x.transpose(0, 1, 3, 2, 4, 5)
+        x = x.reshape(B, self.num_patches, self.patch_size * self.patch_size * C)
+        return x
+    
+    def unpatchify(self, x):
+        B, T, C = x.shape
+        # assert self.patch_size * self.patch_num == self.img_size, "img_size must be divisible by num_patches"
+        x = x.reshape(B, self.img_size // self.patch_size, self.img_size // self.patch_size, self.patch_size, self.patch_size, self.out_channels)
+        x = x.transpose(0, 1, 3, 2, 4, 5)
+        x = x.reshape(B, self.img_size, self.img_size, self.out_channels)
+        return x
+    
+    def setup(self):
+        self.patch_num = patch_num = self.img_size // self.patch_size
+        self.num_patches = patch_num ** 2
+        if self.time_cond_method == 'base':
+            assert False
+            self.unets = [
+                    NCSNpp(
+                        base_width=self.base_width,
+                        img_size=self.img_size,
+                        dropout=self.dropout,
+                        name=f"unet_{i}",
+                    ) for i in range(self.num_unets)
+                ]
+        else:
+            self.unets = [
+                    NCSNpp(
+                        base_width=self.base_width,
+                        img_size=self.img_size,
+                        dropout=self.dropout,
+                        name=f"unet_0",
+                    )
+                ]
+
+    def forward_with_sg(self,
+                x: jnp.ndarray,
+                y: jnp.ndarray | None = None,
+                train: bool = True,
+                rng = None,
+        ):
+            """
+            used for student training.
+            input: x, the output of teacher (latent)
+            Return: a sequence of output of student, from latent to image
+            """
+            B, T, C0 = x.shape
+            x = self.unpatchify(x) 
+
+            B, H, W, C = x.shape
+            assert C == self.out_channels, "input must be RGB image"
+            assert H == W and H == self.img_size, "input must be square image"
+
+            zs = []
+            current_x = x
+            labels = jnp.eye(self.num_classes)[y] if y is not None else None
+            for i in range(self.num_unets):
+                rng, rng_used = safe_split(rng)
+                time_cond = i * jnp.ones((B,), dtype=jnp.float32)
+                if self.time_cond_method == "wot" or self.time_cond_method == "base":
+                    time_cond = 0 * time_cond
+                if self.time_cond_method == "cond" or self.time_cond_method == "wot":
+                    next_x = self.unets[0](current_x, time_cond=time_cond, labels=labels, train=train)
+                else:
+                    next_x = self.unets[i](current_x, time_cond=time_cond, labels=labels, train=train)
+                zs.append(self.patchify(next_x))
+                current_x = jax.lax.stop_gradient(next_x)
+                del rng_used
+            zs = jnp.stack(zs, axis=0)
+            assert zs.shape == (self.num_unets, B, T, C0), f"zs shape: {zs.shape}"
+            return zs
+    
+    # @nn.compact
+    def __call__(self, x, y, *, guidance: float, train: bool, rng):
+        """
+        Args
+        ----
+        x        : (B, T, C0)  — patch tokens
+        y        : (B,)        — class id 或 None
+        guidance : float       — classifier‑free guidance scale
+        train    : bool        — True=dropout/drop‑path on
+        rng      : jax.random.PRNGKey
+        """
+
+        x = self.unpatchify(x)
+        B, _, _, C = x.shape
+        assert C == self.out_channels, "input must be RGB image"
+
+        for i in range(self.num_unets):
+            unet = self.unets[i % self.num_unets]
+            rng, subkey = jax.random.split(rng)
+            time_cond = jnp.full((B,), i, dtype=jnp.float32)
+
+            if self.time_cond_method in {"wot", "base"}:
+                time_cond = jnp.zeros_like(time_cond)
+
+            x_cond = unet(
+                x,
+                time_cond = time_cond,
+                labels    = y,
+                train     = train,
+                rng       = subkey
+            )
+
+            if guidance > 0:
+                x_uncond = unet(
+                    x,
+                    time_cond = time_cond,
+                    labels    = None,
+                    train     = train,
+                    rng       = subkey
+                )
+                x = (1 + guidance) * x_cond - guidance * x_uncond
+            else:
+                x = x_cond
+
+        return self.patchify(x)
+
+
+class UNetTeacherStudent(nn.Module):
+    """
+    UNet teacher-student model.
+    """
+    img_size: int
+    out_channels: int
+    channels: int
+    patch_size: int
+    time_cond_method: str = "base" # options: base, condt, wot
+    num_layers: int = 8
+    num_heads: int = 6
+    num_blocks: int = 8
+    num_classes: int = 1000
+    base_width: int = 32
+    dtype: Any = jnp.float32
+    teacher_dropout: float = 0.0
+    student_dropout: float = 0.0
+    mode: str = "same" # options: same, reverse
+    debug: bool = False
+    prior_norm: float = 1.0 # not supported for now
+
+    def setup(self):
+        self.teacher = NormalizingFlow(
+            img_size=self.img_size,
+            out_channels=self.out_channels,
+            channels=self.channels,
+            patch_size=self.patch_size,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            num_blocks=self.num_blocks,
+            # perms=self.perms,
+            num_classes=self.num_classes,
+            dtype=self.dtype,
+            dropout=self.teacher_dropout,
+            debug=self.debug,
+            prior_norm=self.prior_norm,
+        )
+        assert self.num_blocks % 2 == 0, f"num_blocks must be even, but got {self.num_blocks}"
+        num_unets = self.num_blocks // 2
+        self.student = UNetStudent(
+            patch_size=self.patch_size,
+            img_size=self.img_size,
+            out_channels=self.out_channels,
+            base_width=self.base_width,
+            num_classes=self.num_classes,
+            num_unets=num_unets,
+            time_cond_method=self.time_cond_method,
+            dropout=self.student_dropout,
+        )
+
+    def run_student(self, z, y, *, guidance, train, rng):
+        assert z.ndim == 3, f"input must be 3D tensor, but got {z.ndim}"
+        return self.student(
+            x=z, y=y, guidance=guidance, train=train, rng=rng    # 调子模块
+        )
+                    
+
+    def patchify(self, x):
+        B, H, W, C = x.shape
+        assert C == self.out_channels, "input must be RGB image"
+        x = x.reshape(B, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size, C)
+        x = x.transpose(0, 1, 3, 2, 4, 5)
+        patch_num = self.img_size // self.patch_size
+        num_patches = patch_num ** 2
+        x = x.reshape(B, num_patches, self.patch_size * self.patch_size * C)
+        return x
+        
+    def unpatchify(self, x):
+        B, T, C = x.shape
+        x = x.reshape(B, self.img_size // self.patch_size, self.img_size // self.patch_size, self.patch_size, self.patch_size, self.out_channels)
+        x = x.transpose(0, 1, 3, 2, 4, 5)
+        x = x.reshape(B, self.img_size, self.img_size, self.out_channels)
+        return x
+    
+    def calc_teacher_forward(self, x, y, temp: float = 1.0, which_cache: str = 'cond', train: bool = True):
+        # used for denoise. The loss here is logp.
+        loss, _, _, _, _ = self.teacher(x, y, temp=temp, which_cache=which_cache, train=train)
+        return loss
+
+    def __call__(self, 
+                x: jnp.ndarray, 
+                y: jnp.ndarray | None = None, 
+                # zs: jnp.ndarray | None = None,
+                temp: float = 1.0, 
+                which_cache: str = 'cond', 
+                train: bool = True,
+        ):
+        """
+        Student Train step.
+        """
+        
+        rng = self.make_rng('dropout')
+        rng, rng_used = safe_split(rng)
+        rng, rng_used_2 = safe_split(rng)
+        
+        # generate zs by teacher, from dataset images
+        loss_1, loss_dict_1, zs, _, _ = self.teacher(x, y, temp=temp, which_cache=which_cache, train=False, rng=rng_used)
+        del rng_used
+        loss_dict = {}
+
+        # only implement REVERSE L2
+        # here, the zs is from image to latent, num_blocks+1 z in total.
+        zs = jax.lax.stop_gradient(zs)
+        zs = jnp.flip(zs, axis=0) # flip to latent to image
+        
+        # xs, alphas, mus = self.student.forward_on_each_block(zs[:-1], y, temp=temp, which_cache=which_cache, train=train, rng=rng_used_2) # old loss
+        xs = self.student.forward_with_sg(zs[0], y, train=train, rng=rng_used_2) # lyy's smart loss
+        # xs: from latent (not contained) to image
+        zs = zs[2::2] # two blocks per supervision
+        
+        losses = jnp.mean((xs - zs) ** 2, axis=(1, 2, 3))
+        norm_x = jnp.mean(xs ** 2, axis=(1, 2, 3))
+        norm_z = jnp.mean(zs ** 2, axis=(1, 2, 3))
+        norm_x = jax.lax.stop_gradient(norm_x)
+        norm_z = jax.lax.stop_gradient(norm_z)
+        
+        # this order is latent to image
+        for i in range(len(losses)):
+            loss_dict[f"block_{i}"] = losses[i]
+        for i in range(len(norm_x)): # student
+            loss_dict[f"norm_x_{i}"] = norm_x[i]
+        for i in range(len(norm_z)): # teacher
+            loss_dict[f"norm_z_{i}"] = norm_z[i]
+            
+        # losses /= (norm_x + norm_z)
+        # losses *= jnp.mean(norm_x + norm_z)
+        loss = jnp.sum(losses)
+            
+        loss_dict['loss'] = loss
+        
+        return loss, loss_dict, zs
+
 
 class NormalizingFlow(nn.Module):
     """Normalizing flow."""
@@ -170,11 +440,6 @@ class NormalizingFlow(nn.Module):
         assert self.patch_size * patch_num == self.img_size, "img_size must be divisible by num_patches"
         
         judge = lambda idx: (idx + self.reverse_perm) % 2 == 1
-        
-        # if self.teacher_nblocks is not None:
-        #     log_for_0(f"teacher_nblocks: {self.teacher_nblocks}")
-        #     map_fn = get_map_fn(self.load_pretrain_method, self.teacher_nblocks, self.num_blocks)
-        #     judge = lambda idx: map_fn(idx) % 2 == 1
         
         log_for_0(f"judge result: {[judge(i) for i in range(self.num_blocks)]}")
         self.blocks = [
@@ -211,37 +476,6 @@ class NormalizingFlow(nn.Module):
         x = x.reshape(B, self.img_size, self.img_size, self.out_channels)
         return x
     
-    def forward_on_each_block(self,
-                xs: jnp.ndarray,
-                y: jnp.ndarray | None = None,
-                temp: float = 1.0,
-                which_cache: str = 'cond',
-                train: bool = True,
-                rng = None,
-        ):
-            # used for student training, for vanilla L2 loss. We now use forward_with_sg with lyy's smart loss instead.
-            raise DeprecationWarning
-            N = xs.shape[0]
-            assert N == self.num_blocks
-            zs = jnp.zeros_like(xs)
-            alphas = jnp.zeros_like(xs)
-            mus = jnp.zeros_like(xs)
-            
-            # xs_new = xs
-            # rng, rng_used = safe_split(rng)
-            # z_temp, _, alpha, mu = self.blocks[0].forward(xs_new[0], y, temp=temp, which_cache=which_cache, train=train, rng=rng)
-            # xs_new = xs_new.at[0].set(z_temp)
-            
-            for i in range(N):
-                rng, rng_used = safe_split(rng)
-                z, _, alpha, mu = self.blocks[i].forward(xs[i], y, temp=temp, which_cache=which_cache, train=train, rng=rng_used)
-                zs = zs.at[i].set(z)
-                alphas = alphas.at[i].set(alpha)
-                mus = mus.at[i].set(mu)
-                del rng_used
-            
-            return zs, alphas, mus
-    
     def forward_with_sg(self,
                 x: jnp.ndarray,
                 y: jnp.ndarray | None = None,
@@ -251,7 +485,7 @@ class NormalizingFlow(nn.Module):
                 rng = None,
         ):
             """
-            used for student traning.
+            used for student training.
             input: x, the output of teacher (latent)
             Return: a sequence of output of student, from latent to image
             """
@@ -320,206 +554,10 @@ class NormalizingFlow(nn.Module):
         loss_dict = {'loss': loss, 'log_det': tot_logdet.mean(), 'log_prior': log_prior}
         
         return loss, loss_dict, xs, alphas, mus
-    
-class TeacherStudent(nn.Module):
-    """Normalizing flow, teacher-student model."""
-    
-    img_size: int
-    out_channels: int
-    channels: int
-    patch_size: int
-    num_layers: int
-    num_heads: int
-    num_blocks: int
-    # perms: list[PermutationConfig]
-    num_classes: int = 0
-    dtype: Any = jnp.float32
-    teacher_dropout: float = 0.0
-    student_dropout: float = 0.0
-    mode: str = "same" # options: same, reverse
-    debug: bool = False
-    prior_norm: float = 1.0 # not supported for now
-    
-    def setup(self):
-        assert self.prior_norm == 1.0, f"prior_norm is not supported for now, but got {self.prior_norm}"
-        assert self.mode == "reverse"
-        self.teacher = NormalizingFlow(
-            img_size=self.img_size,
-            out_channels=self.out_channels,
-            channels=self.channels,
-            patch_size=self.patch_size,
-            num_layers=self.num_layers,
-            num_heads=self.num_heads,
-            num_blocks=self.num_blocks,
-            # perms=self.perms,
-            num_classes=self.num_classes,
-            dtype=self.dtype,
-            dropout=self.teacher_dropout,
-            debug=self.debug,
-            prior_norm=self.prior_norm,
-        )
-        # the order of student is: first block corresponds to noise end. It is reverse of teacher.
-        self.student = NormalizingFlow(
-            img_size=self.img_size,
-            out_channels=self.out_channels,
-            channels=self.channels,
-            patch_size=self.patch_size,
-            num_layers=int(self.num_layers),
-            num_heads=self.num_heads,
-            num_blocks=self.num_blocks,
-            reverse_perm=self.num_blocks-1,
-            num_classes=self.num_classes,
-            dtype=self.dtype,
-            dropout=self.student_dropout,
-            mode=self.mode,
-            debug=self.debug,
-            prior_norm=self.prior_norm,
-        )
-        
-    def patchify(self, x):
-        B, H, W, C = x.shape
-        assert C == self.out_channels, "input must be RGB image"
-        x = x.reshape(B, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size, C)
-        x = x.transpose(0, 1, 3, 2, 4, 5)
-        patch_num = self.img_size // self.patch_size
-        num_patches = patch_num ** 2
-        x = x.reshape(B, num_patches, self.patch_size * self.patch_size * C)
-        return x
-        
-    def unpatchify(self, x):
-        B, T, C = x.shape
-        x = x.reshape(B, self.img_size // self.patch_size, self.img_size // self.patch_size, self.patch_size, self.patch_size, self.out_channels)
-        x = x.transpose(0, 1, 3, 2, 4, 5)
-        x = x.reshape(B, self.img_size, self.img_size, self.out_channels)
-        return x
 
-    def calc_teacher_forward(self, x, y, temp: float = 1.0, which_cache: str = 'cond', train: bool = True):
-        # used for denoise. The loss here is logp.
-        loss, _, _, _, _ = self.teacher(x, y, temp=temp, which_cache=which_cache, train=train)
-        return loss
-    
-    def __call__(self, 
-                x: jnp.ndarray, 
-                y: jnp.ndarray | None = None, 
-                # zs: jnp.ndarray | None = None,
-                temp: float = 1.0, 
-                which_cache: str = 'cond', 
-                train: bool = True,
-        ):
-        """
-        Student Train step.
-        """
-        
-        rng = self.make_rng('dropout')
-        rng, rng_used = safe_split(rng)
-        rng, rng_used_2 = safe_split(rng)
-        
-        # generate zs by teacher, from dataset images
-        loss_1, loss_dict_1, zs, _, _ = self.teacher(x, y, temp=temp, which_cache=which_cache, train=False, rng=rng_used)
-        del rng_used
-        loss_dict = {}
-
-        # only implement REVERSE L2
-        # here, the zs is from image to latent, num_blocks+1 z in total.
-        zs = jax.lax.stop_gradient(zs)
-        zs = jnp.flip(zs, axis=0) # flip to latent to image
-        
-        # xs, alphas, mus = self.student.forward_on_each_block(zs[:-1], y, temp=temp, which_cache=which_cache, train=train, rng=rng_used_2) # old loss
-        xs = self.student.forward_with_sg(zs[0], y, temp=temp, which_cache=which_cache, train=train, rng=rng_used_2) # lyy's smart loss
-        # xs: from latent (not contained) to image
-        
-        losses = jnp.mean((xs - zs[1:]) ** 2, axis=(1, 2, 3))
-        norm_x = jnp.mean(xs ** 2, axis=(1, 2, 3))
-        norm_z = jnp.mean(zs[1:] ** 2, axis=(1, 2, 3))
-        norm_x = jax.lax.stop_gradient(norm_x)
-        norm_z = jax.lax.stop_gradient(norm_z)
-        
-        # this order is latent to image
-        for i in range(len(losses)):
-            loss_dict[f"block_{i}"] = losses[i]
-        for i in range(len(norm_x)): # student
-            loss_dict[f"norm_x_{i}"] = norm_x[i]
-        for i in range(len(norm_z)): # teacher
-            loss_dict[f"norm_z_{i}"] = norm_z[i]
-            
-        # losses /= (norm_x + norm_z)
-        # losses *= jnp.mean(norm_x + norm_z)
-        loss = jnp.sum(losses)
-            
-        loss_dict['loss'] = loss
-        
-        return loss, loss_dict, zs
-
-    
-def reverse(params,
-            nf: TeacherStudent,
-            x: jnp.ndarray,
-            y: jnp.ndarray | None = None,
-            temp: float = 1.0,
-            guidance: float = 0,
-            guidance_method: str = "x", # options: ['x', 'ma']
-            which_cache: str = 'cond',
-            train: bool = False):
-    """
-    used for teacher generation.
-    """
-    assert guidance_method == "ma", f"only support x guidance, but got {guidance_method}"
-    # print('param keys:', params['params'].keys())
-    patch_num = nf.img_size // nf.patch_size
-    num_patches = patch_num ** 2
-    in_channels = nf.out_channels * nf.patch_size * nf.patch_size
-
-    for i in range(nf.num_blocks-1,-1,-1):
-        block_param = params['params']['teacher'][f'blocks_{i}']
-        # x = block.reverse(x, y, temp=temp, which_cache=which_cache, train=train)
-        x = reverse_block({"params": block_param}, MetaBlock(
-                in_channels=in_channels, 
-                channels=nf.channels, 
-                num_patches=num_patches, 
-                num_layers=nf.num_layers, 
-                num_heads=nf.num_heads, 
-                num_classes=nf.num_classes, 
-                permutation=PermutationFlip(i % 2 == 1),
-                debug=nf.debug,
-            ), x, y, temp=temp, which_cache=which_cache, train=train, guidance=guidance)
-        # print("mean during layer:", x.mean())
-    x = nf.unpatchify(x)
-    return x
-
-def reverse_student(params,
-            nf: TeacherStudent,
-            x: jnp.ndarray,
-            y: jnp.ndarray | None = None,
-            temp: float = 1.0,
-            guidance: float = 0,
-            guidance_method: str = "x", # options: ['x', 'ma']
-            which_cache: str = 'cond',
-            train: bool = False):
-    print('param keys:', params['params'].keys())
-    patch_num = nf.img_size // nf.patch_size
-    num_patches = patch_num ** 2
-    in_channels = nf.out_channels * nf.patch_size * nf.patch_size
-    assert nf.mode == "reverse", f"only support reverse, but got {nf.mode}"
-    # start loop. The order of student is the first block corresponds to noise end. It is reverse of teacher.
-    for i in range(nf.num_blocks):
-        block_param = params['params']['student'][f'blocks_{i}']
-        x = reverse_block_student({"params": block_param}, MetaBlock(
-                in_channels=in_channels, 
-                channels=nf.channels, 
-                num_patches=num_patches, 
-                num_layers=int(nf.num_layers), 
-                num_heads=nf.num_heads, 
-                num_classes=nf.num_classes, 
-                permutation=PermutationFlip((nf.num_blocks-1-i)%2==1),
-                mode=nf.mode,
-                debug=nf.debug,
-            ), x, y, temp=temp, which_cache=which_cache, train=train, guidance=guidance, guidance_method=guidance_method)
-        # print("mean during layer:", x.mean())
-    x = nf.unpatchify(x)
-    return x
 
 # move this out from model for JAX compilation
-def generate(params, model: TeacherStudent, rng, n_sample, noise_level, guidance, guidance_method, temperature=1.0, label_cond=True, denoise=True, use_student=False):
+def generate(params, model: UNetTeacherStudent, rng, n_sample, noise_level, guidance, guidance_method, temperature=1.0, label_cond=True, denoise=True, use_student=False):
     """
     Generate samples from the model.
     used for teacher generation.
@@ -530,20 +568,24 @@ def generate(params, model: TeacherStudent, rng, n_sample, noise_level, guidance
     x_shape = (n_sample, num_patches, in_channels)
     rng_used, rng = jax.random.split(rng, 2)
     rng_used_2, rng = jax.random.split(rng, 2)
+    rng_used_3, rng = jax.random.split(rng, 2)
     z = jax.random.normal(rng_used, x_shape, dtype=model.dtype) * model.prior_norm
 
     if label_cond:
         y = jax.random.randint(rng_used_2, (n_sample,), 0, model.num_classes)
     else:
         y = None
+
+    x = model.apply({'params':params['params']}, z=z, y=y, guidance=guidance, train=False, rng=rng_used_3, method=model.run_student)
     
-    rev_fn = reverse_student if use_student else reverse
-    if label_cond:
-        x = rev_fn(params, model, z, y, guidance=guidance, guidance_method=guidance_method, temp=1.0)
-    else:
-        x = rev_fn(params, model, z, y, guidance=guidance, guidance_method=guidance_method, temp=temperature)
+    # rev_fn = reverse_student if use_student else reverse
+    # if label_cond:
+    #     x = rev_fn(params, model, z, y, guidance=guidance, guidance_method=guidance_method, temp=1.0)
+    # else:
+    #     x = rev_fn(params, model, z, y, guidance=guidance, guidance_method=guidance_method, temp=temperature)
     
     if noise_level == 0 or not denoise: return x
+
     def nabla_log_prob(x):
         loss = model.apply(params, x, y, method=model.calc_teacher_forward)
         return loss
@@ -554,47 +596,244 @@ def generate(params, model: TeacherStudent, rng, n_sample, noise_level, guidance
     x = x - (noise_level ** 2) * grad_dir # use score-based model to denoise
     
     return x
-
-def generate_prior(params, model: TeacherStudent, rng, n_sample, noise_level, guidance, temperature=1.0, label_cond=True):
-    # first teacher generate image, then flow using student to get latent. just for debug.
-    patch_num = model.img_size // model.patch_size
-    num_patches = patch_num ** 2
-    in_channels = model.out_channels * model.patch_size * model.patch_size
-    x_shape = (n_sample, num_patches, in_channels)
-    rng_used, rng = jax.random.split(rng, 2)
-    rng_used_2, rng = jax.random.split(rng, 2)
-    z = jax.random.normal(rng_used, x_shape, dtype=model.dtype)
-    if label_cond:
-        y = jax.random.randint(rng_used_2, (n_sample,), 0, model.num_classes)
-    else:
-        y = None
     
-    if label_cond:
-        x = reverse(params, model, z, y, guidance=guidance, temp=1.0)
-    else:
-        x = reverse(params, model, z, y, guidance=guidance, temp=temperature)
+# class TeacherStudent(nn.Module):
+#     """Normalizing flow, teacher-student model."""
     
-    z = model.apply(params, x, method=model.patchify)
+#     img_size: int
+#     out_channels: int
+#     channels: int
+#     patch_size: int
+#     num_layers: int
+#     num_heads: int
+#     num_blocks: int
+#     # perms: list[PermutationConfig]
+#     num_classes: int = 0
+#     dtype: Any = jnp.float32
+#     teacher_dropout: float = 0.0
+#     student_dropout: float = 0.0
+#     mode: str = "same" # options: same, reverse
+#     debug: bool = False
+#     prior_norm: float = 1.0 # not supported for now
     
-    # student. from block n-1 to 0.
-    for i in range(model.num_blocks-1,-1,-1):
-        block_param = params['params']['student'][f'blocks_{i}']
-        z = reverse_block({"params": block_param}, MetaBlock(
-                in_channels=in_channels, 
-                channels=model.channels, 
-                num_patches=num_patches, 
-                num_layers=int(model.num_layers), 
-                num_heads=model.num_heads, 
-                num_classes=model.num_classes, 
-                permutation=PermutationFlip((model.num_blocks-1-i)%2==1),
-                debug=model.debug,
-                mode=model.mode,
-        ), z, y)
+#     def setup(self):
+#         assert self.prior_norm == 1.0, f"prior_norm is not supported for now, but got {self.prior_norm}"
+#         assert self.mode == "reverse"
+#         self.teacher = NormalizingFlow(
+#             img_size=self.img_size,
+#             out_channels=self.out_channels,
+#             channels=self.channels,
+#             patch_size=self.patch_size,
+#             num_layers=self.num_layers,
+#             num_heads=self.num_heads,
+#             num_blocks=self.num_blocks,
+#             # perms=self.perms,
+#             num_classes=self.num_classes,
+#             dtype=self.dtype,
+#             dropout=self.teacher_dropout,
+#             debug=self.debug,
+#             prior_norm=self.prior_norm,
+#         )
+#         # the order of student is: first block corresponds to noise end. It is reverse of teacher.
+#         self.student = NormalizingFlow(
+#             img_size=self.img_size,
+#             out_channels=self.out_channels,
+#             channels=self.channels,
+#             patch_size=self.patch_size,
+#             num_layers=int(self.num_layers),
+#             num_heads=self.num_heads,
+#             num_blocks=self.num_blocks,
+#             reverse_perm=self.num_blocks-1,
+#             num_classes=self.num_classes,
+#             dtype=self.dtype,
+#             dropout=self.student_dropout,
+#             mode=self.mode,
+#             debug=self.debug,
+#             prior_norm=self.prior_norm,
+#         )
         
-    z = model.unpatchify(z)
-    # x_recover = model.apply(params, z, y, method=model.calc_student_forward)
-    # x_recover = model.unpatchify(x_recover)
-    return x, z
+#     def patchify(self, x):
+#         B, H, W, C = x.shape
+#         assert C == self.out_channels, "input must be RGB image"
+#         x = x.reshape(B, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size, C)
+#         x = x.transpose(0, 1, 3, 2, 4, 5)
+#         patch_num = self.img_size // self.patch_size
+#         num_patches = patch_num ** 2
+#         x = x.reshape(B, num_patches, self.patch_size * self.patch_size * C)
+#         return x
+        
+#     def unpatchify(self, x):
+#         B, T, C = x.shape
+#         x = x.reshape(B, self.img_size // self.patch_size, self.img_size // self.patch_size, self.patch_size, self.patch_size, self.out_channels)
+#         x = x.transpose(0, 1, 3, 2, 4, 5)
+#         x = x.reshape(B, self.img_size, self.img_size, self.out_channels)
+#         return x
+
+#     def calc_teacher_forward(self, x, y, temp: float = 1.0, which_cache: str = 'cond', train: bool = True):
+#         # used for denoise. The loss here is logp.
+#         loss, _, _, _, _ = self.teacher(x, y, temp=temp, which_cache=which_cache, train=train)
+#         return loss
+    
+#     def __call__(self, 
+#                 x: jnp.ndarray, 
+#                 y: jnp.ndarray | None = None, 
+#                 # zs: jnp.ndarray | None = None,
+#                 temp: float = 1.0, 
+#                 which_cache: str = 'cond', 
+#                 train: bool = True,
+#         ):
+#         """
+#         Student Train step.
+#         """
+        
+#         rng = self.make_rng('dropout')
+#         rng, rng_used = safe_split(rng)
+#         rng, rng_used_2 = safe_split(rng)
+        
+#         # generate zs by teacher, from dataset images
+#         loss_1, loss_dict_1, zs, _, _ = self.teacher(x, y, temp=temp, which_cache=which_cache, train=False, rng=rng_used)
+#         del rng_used
+#         loss_dict = {}
+
+#         # only implement REVERSE L2
+#         # here, the zs is from image to latent, num_blocks+1 z in total.
+#         zs = jax.lax.stop_gradient(zs)
+#         zs = jnp.flip(zs, axis=0) # flip to latent to image
+        
+#         # xs, alphas, mus = self.student.forward_on_each_block(zs[:-1], y, temp=temp, which_cache=which_cache, train=train, rng=rng_used_2) # old loss
+#         xs = self.student.forward_with_sg(zs[0], y, temp=temp, which_cache=which_cache, train=train, rng=rng_used_2) # lyy's smart loss
+#         # xs: from latent (not contained) to image
+        
+#         losses = jnp.mean((xs - zs[1:]) ** 2, axis=(1, 2, 3))
+#         norm_x = jnp.mean(xs ** 2, axis=(1, 2, 3))
+#         norm_z = jnp.mean(zs[1:] ** 2, axis=(1, 2, 3))
+#         norm_x = jax.lax.stop_gradient(norm_x)
+#         norm_z = jax.lax.stop_gradient(norm_z)
+        
+#         # this order is latent to image
+#         for i in range(len(losses)):
+#             loss_dict[f"block_{i}"] = losses[i]
+#         for i in range(len(norm_x)): # student
+#             loss_dict[f"norm_x_{i}"] = norm_x[i]
+#         for i in range(len(norm_z)): # teacher
+#             loss_dict[f"norm_z_{i}"] = norm_z[i]
+            
+#         # losses /= (norm_x + norm_z)
+#         # losses *= jnp.mean(norm_x + norm_z)
+#         loss = jnp.sum(losses)
+            
+#         loss_dict['loss'] = loss
+        
+#         return loss, loss_dict, zs
+
+    
+# def reverse(params,
+#             nf: TeacherStudent,
+#             x: jnp.ndarray,
+#             y: jnp.ndarray | None = None,
+#             temp: float = 1.0,
+#             guidance: float = 0,
+#             guidance_method: str = "x", # options: ['x', 'ma']
+#             which_cache: str = 'cond',
+#             train: bool = False):
+#     """
+#     used for teacher generation.
+#     """
+#     assert guidance_method == "ma", f"only support x guidance, but got {guidance_method}"
+#     # print('param keys:', params['params'].keys())
+#     patch_num = nf.img_size // nf.patch_size
+#     num_patches = patch_num ** 2
+#     in_channels = nf.out_channels * nf.patch_size * nf.patch_size
+
+#     for i in range(nf.num_blocks-1,-1,-1):
+#         block_param = params['params']['teacher'][f'blocks_{i}']
+#         # x = block.reverse(x, y, temp=temp, which_cache=which_cache, train=train)
+#         x = reverse_block({"params": block_param}, MetaBlock(
+#                 in_channels=in_channels, 
+#                 channels=nf.channels, 
+#                 num_patches=num_patches, 
+#                 num_layers=nf.num_layers, 
+#                 num_heads=nf.num_heads, 
+#                 num_classes=nf.num_classes, 
+#                 permutation=PermutationFlip(i % 2 == 1),
+#                 debug=nf.debug,
+#             ), x, y, temp=temp, which_cache=which_cache, train=train, guidance=guidance)
+#         # print("mean during layer:", x.mean())
+#     x = nf.unpatchify(x)
+#     return x
+
+# def reverse_student(params,
+#             nf: TeacherStudent,
+#             x: jnp.ndarray,
+#             y: jnp.ndarray | None = None,
+#             temp: float = 1.0,
+#             guidance: float = 0,
+#             guidance_method: str = "x", # options: ['x', 'ma']
+#             which_cache: str = 'cond',
+#             train: bool = False):
+#     print('param keys:', params['params'].keys())
+#     patch_num = nf.img_size // nf.patch_size
+#     num_patches = patch_num ** 2
+#     in_channels = nf.out_channels * nf.patch_size * nf.patch_size
+#     assert nf.mode == "reverse", f"only support reverse, but got {nf.mode}"
+#     # start loop. The order of student is the first block corresponds to noise end. It is reverse of teacher.
+#     for i in range(nf.num_blocks):
+#         block_param = params['params']['student'][f'blocks_{i}']
+#         x = reverse_block_student({"params": block_param}, MetaBlock(
+#                 in_channels=in_channels, 
+#                 channels=nf.channels, 
+#                 num_patches=num_patches, 
+#                 num_layers=int(nf.num_layers), 
+#                 num_heads=nf.num_heads, 
+#                 num_classes=nf.num_classes, 
+#                 permutation=PermutationFlip((nf.num_blocks-1-i)%2==1),
+#                 mode=nf.mode,
+#                 debug=nf.debug,
+#             ), x, y, temp=temp, which_cache=which_cache, train=train, guidance=guidance, guidance_method=guidance_method)
+#         # print("mean during layer:", x.mean())
+#     x = nf.unpatchify(x)
+#     return x
+
+# def generate_prior(params, model: TeacherStudent, rng, n_sample, noise_level, guidance, temperature=1.0, label_cond=True):
+#     # first teacher generate image, then flow using student to get latent. just for debug.
+#     patch_num = model.img_size // model.patch_size
+#     num_patches = patch_num ** 2
+#     in_channels = model.out_channels * model.patch_size * model.patch_size
+#     x_shape = (n_sample, num_patches, in_channels)
+#     rng_used, rng = jax.random.split(rng, 2)
+#     rng_used_2, rng = jax.random.split(rng, 2)
+#     z = jax.random.normal(rng_used, x_shape, dtype=model.dtype)
+#     if label_cond:
+#         y = jax.random.randint(rng_used_2, (n_sample,), 0, model.num_classes)
+#     else:
+#         y = None
+    
+#     if label_cond:
+#         x = reverse(params, model, z, y, guidance=guidance, temp=1.0)
+#     else:
+#         x = reverse(params, model, z, y, guidance=guidance, temp=temperature)
+    
+#     z = model.apply(params, x, method=model.patchify)
+    
+#     # student. from block n-1 to 0.
+#     for i in range(model.num_blocks-1,-1,-1):
+#         block_param = params['params']['student'][f'blocks_{i}']
+#         z = reverse_block({"params": block_param}, MetaBlock(
+#                 in_channels=in_channels, 
+#                 channels=model.channels, 
+#                 num_patches=num_patches, 
+#                 num_layers=int(model.num_layers), 
+#                 num_heads=model.num_heads, 
+#                 num_classes=model.num_classes, 
+#                 permutation=PermutationFlip((model.num_blocks-1-i)%2==1),
+#                 debug=model.debug,
+#                 mode=model.mode,
+#         ), z, y)
+        
+#     z = model.unpatchify(z)
+#     # x_recover = model.apply(params, z, y, method=model.calc_student_forward)
+#     # x_recover = model.unpatchify(x_recover)
+#     return x, z
     
 
 NF_Debug = partial(
@@ -652,8 +891,12 @@ NF_Default = partial(
     NormalizingFlow, img_size=32, out_channels=4, channels=384, patch_size=4, num_layers=8, num_heads=6, num_blocks=8,
 )
 
-TSNF_Small_p2_b8_l8 = partial(
-    TeacherStudent, img_size=32, out_channels=4, channels=384, patch_size=2, num_layers=8, num_heads=6, num_blocks=8, mode="reverse",
+# TSNF_Small_p2_b8_l8 = partial(
+#     TeacherStudent, img_size=32, out_channels=4, channels=384, patch_size=2, num_layers=8, num_heads=6, num_blocks=8, mode="reverse",
+# )
+
+UNET = partial(
+    UNetTeacherStudent, img_size=32, out_channels=4, channels=384, patch_size=2, num_layers=8, num_heads=6, num_blocks=8,
 )
 
 if __name__== "__main__":
@@ -682,34 +925,34 @@ if __name__== "__main__":
     #     num_classes=10,
     #     debug=True,
     # )
-    model = NormalizingFlow(
-        img_size=6,
-        out_channels=3,
-        channels=4,
-        patch_size=2,
-        num_layers=1,
-        num_heads=2,
-        num_blocks=1,
-        num_classes=10,
-        debug=True,
-    )
-    variables = model.init(jax.random.PRNGKey(0), jnp.ones((2, 6, 6, 3),dtype=jnp.float32), jnp.ones((2,),dtype=jnp.int32))
-    x = jax.random.normal(jax.random.PRNGKey(0), (7, 6, 6, 3))
-    print(x.mean(axis=(1, 2, 3)))
-    # y = np.random.randint(0, 10, (7,))
-    y = jax.random.randint(jax.random.PRNGKey(0), (7,), 0, 10)
-    loss, _, z = model.apply(variables, x, y, rngs={"dropout": jax.random.PRNGKey(0)})
-    print('latent shape:', z.shape) # should be: (7, 9, 12)
-    print('is z nan?', jnp.isnan(z).any())
-    back = reverse(variables, model, z, y)
-    loss, _, backagain = model.apply(variables, back, y, rngs={"dropout": jax.random.PRNGKey(0)})
-    # print(back.mean(axis=(1, 2, 3)))
-    print('back.shape', back.shape) # should be: (7, 6, 6, 3)
-    print('check x==back', ((x-back) ** 2).mean(axis=(1, 2, 3)))
-    print('check z==backagain', ((z-backagain) ** 2).mean(axis=(1, 2)))
+    # model = NormalizingFlow(
+    #     img_size=6,
+    #     out_channels=3,
+    #     channels=4,
+    #     patch_size=2,
+    #     num_layers=1,
+    #     num_heads=2,
+    #     num_blocks=1,
+    #     num_classes=10,
+    #     debug=True,
+    # )
+    # variables = model.init(jax.random.PRNGKey(0), jnp.ones((2, 6, 6, 3),dtype=jnp.float32), jnp.ones((2,),dtype=jnp.int32))
+    # x = jax.random.normal(jax.random.PRNGKey(0), (7, 6, 6, 3))
+    # print(x.mean(axis=(1, 2, 3)))
+    # # y = np.random.randint(0, 10, (7,))
+    # y = jax.random.randint(jax.random.PRNGKey(0), (7,), 0, 10)
+    # loss, _, z = model.apply(variables, x, y, rngs={"dropout": jax.random.PRNGKey(0)})
+    # print('latent shape:', z.shape) # should be: (7, 9, 12)
+    # print('is z nan?', jnp.isnan(z).any())
+    # # back = reverse(variables, model, z, y)
+    # loss, _, backagain = model.apply(variables, back, y, rngs={"dropout": jax.random.PRNGKey(0)})
+    # # print(back.mean(axis=(1, 2, 3)))
+    # print('back.shape', back.shape) # should be: (7, 6, 6, 3)
+    # print('check x==back', ((x-back) ** 2).mean(axis=(1, 2, 3)))
+    # print('check z==backagain', ((z-backagain) ** 2).mean(axis=(1, 2)))
     
-    print(jnp.allclose(x, back, atol=1e-5))
+    # print(jnp.allclose(x, back, atol=1e-5))
 
-    # test generate
-    x_gen = generate(variables, model, jax.random.PRNGKey(0), 7)
-    print(x_gen.shape) # should be: (7, 6, 6, 3)
+    # # test generate
+    # x_gen = generate(variables, model, jax.random.PRNGKey(0), 7)
+    # print(x_gen.shape) # should be: (7, 6, 6, 3)

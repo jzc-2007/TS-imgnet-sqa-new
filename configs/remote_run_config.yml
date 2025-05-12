@@ -25,10 +25,11 @@ training:
     ema_schedule: const # or edm
     lr_schedule: const
 model:
-    name: TSNF_Small_p2_b8_l8 # 118M
+    name: UNET
     teacher_dropout: 0.0
     student_dropout: 0.1
-    # prior_norm: 0.5 # not supported now
+    time_cond_method: base
+
 teacher: # for load teacher
     name: NF_Small_p2_b8_l8
     dropout: 0.0 # TODO: check this dp
