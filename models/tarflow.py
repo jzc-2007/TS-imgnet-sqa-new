@@ -249,7 +249,10 @@ class UNetStudent(nn.Module):
         assert C == self.out_channels, "input must be RGB image"
 
         for i in range(self.num_unets):
-            unet = self.unets[i % self.num_unets]
+            if self.time_cond_method == "wot" or self.time_cond_method == "cond":
+                unet = self.unets[0]
+            else:
+                unet = self.unets[i]
             rng, subkey = jax.random.split(rng)
             time_cond = jnp.full((B,), i, dtype=jnp.float32)
 
@@ -276,7 +279,7 @@ class UNetStudent(nn.Module):
             else:
                 x = x_cond
 
-        return self.patchify(x)
+        return x
 
 
 class UNetTeacherStudent(nn.Module):
@@ -576,7 +579,9 @@ def generate(params, model: UNetTeacherStudent, rng, n_sample, noise_level, guid
     else:
         y = None
 
-    x = model.apply({'params':params['params']}, z=z, y=y, guidance=guidance, train=False, rng=rng_used_3, method=model.run_student)
+    labels = jnp.eye(model.num_classes)[y] if y is not None else None
+
+    x = model.apply({'params':params['params']}, z=z, y=labels, guidance=guidance, train=False, rng=rng_used_3, method=model.run_student)
     
     # rev_fn = reverse_student if use_student else reverse
     # if label_cond:
@@ -897,6 +902,10 @@ NF_Default = partial(
 
 UNET = partial(
     UNetTeacherStudent, img_size=32, out_channels=4, channels=384, patch_size=2, num_layers=8, num_heads=6, num_blocks=8,
+)
+
+UNET_debug = partial(
+    UNetTeacherStudent, img_size=32, out_channels=4, channels=12, patch_size=2, num_layers=2, num_heads=1, num_blocks=4,
 )
 
 if __name__== "__main__":
